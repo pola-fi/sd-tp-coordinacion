@@ -61,46 +61,47 @@ func (sum *Sum) Run() {
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	message, err := inner.Deserialize(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
 
-	if isEof {
-		if err := sum.handleEndOfRecordMessage(); err != nil {
+	switch message.Type {
+	case inner.EOFMessage:
+		if err := sum.handleEndOfRecordMessage(message.ClientID); err != nil {
 			slog.Error("While handling end of record message", "err", err)
 		}
-		return
-	}
-
-	if err := sum.handleDataMessage(fruitRecords); err != nil {
-		slog.Error("While handling data message", "err", err)
+	case inner.DataMessage:
+		if err := sum.handleDataMessage(message.Items); err != nil {
+			slog.Error("While handling data message", "err", err)
+		}
+	default:
+		slog.Error("Unexpected inner message type", "type", message.Type)
 	}
 }
 
-func (sum *Sum) handleEndOfRecordMessage() error {
+func (sum *Sum) handleEndOfRecordMessage(clientID uint32) error {
 	slog.Info("Received End Of Records message")
 	for key := range sum.fruitItemMap {
 		fruitRecord := []fruititem.FruitItem{sum.fruitItemMap[key]}
-		message, err := inner.SerializeMessage(fruitRecord)
+		wire, err := inner.Serialize(inner.Message{Type: inner.DataMessage, ClientID: clientID, Items: fruitRecord})
 		if err != nil {
 			slog.Debug("While serializing message", "err", err)
 			return err
 		}
-		if err := sum.outputExchange.Send(*message); err != nil {
+		if err := sum.outputExchange.Send(*wire); err != nil {
 			slog.Debug("While sending message", "err", err)
 			return err
 		}
 	}
 
-	eofMessage := []fruititem.FruitItem{}
-	message, err := inner.SerializeMessage(eofMessage)
+	wire, err := inner.Serialize(inner.Message{Type: inner.EOFMessage, ClientID: clientID})
 	if err != nil {
 		slog.Debug("While serializing EOF message", "err", err)
 		return err
 	}
-	if err := sum.outputExchange.Send(*message); err != nil {
+	if err := sum.outputExchange.Send(*wire); err != nil {
 		slog.Debug("While sending EOF message", "err", err)
 		return err
 	}

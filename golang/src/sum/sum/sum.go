@@ -21,9 +21,9 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	inputQueue     middleware.Middleware
-	outputExchange middleware.Middleware
-	fruitItemMap   map[string]fruititem.FruitItem
+	inputQueue        middleware.Middleware
+	outputExchange    middleware.Middleware
+	fruitItemByClient map[uint32]map[string]fruititem.FruitItem
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -46,9 +46,9 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}
 
 	return &Sum{
-		inputQueue:     inputQueue,
-		outputExchange: outputExchange,
-		fruitItemMap:   map[string]fruititem.FruitItem{},
+		inputQueue:        inputQueue,
+		outputExchange:    outputExchange,
+		fruitItemByClient: map[uint32]map[string]fruititem.FruitItem{},
 	}, nil
 }
 
@@ -73,7 +73,7 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 			slog.Error("While handling end of record message", "err", err)
 		}
 	case inner.DataMessage:
-		if err := sum.handleDataMessage(message.Items); err != nil {
+		if err := sum.handleDataMessage(message.ClientID, message.Items); err != nil {
 			slog.Error("While handling data message", "err", err)
 		}
 	default:
@@ -83,8 +83,11 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 
 func (sum *Sum) handleEndOfRecordMessage(clientID uint32) error {
 	slog.Info("Received End Of Records message")
-	for key := range sum.fruitItemMap {
-		fruitRecord := []fruititem.FruitItem{sum.fruitItemMap[key]}
+	fruitItemMap := sum.fruitItemByClient[clientID]
+	defer delete(sum.fruitItemByClient, clientID)
+
+	for key := range fruitItemMap {
+		fruitRecord := []fruititem.FruitItem{fruitItemMap[key]}
 		wire, err := inner.Serialize(inner.Message{Type: inner.DataMessage, ClientID: clientID, Items: fruitRecord})
 		if err != nil {
 			slog.Debug("While serializing message", "err", err)
@@ -108,13 +111,19 @@ func (sum *Sum) handleEndOfRecordMessage(clientID uint32) error {
 	return nil
 }
 
-func (sum *Sum) handleDataMessage(fruitRecords []fruititem.FruitItem) error {
+func (sum *Sum) handleDataMessage(clientID uint32, fruitRecords []fruititem.FruitItem) error {
+	fruitItemMap := sum.fruitItemByClient[clientID]
+	if fruitItemMap == nil {
+		fruitItemMap = map[string]fruititem.FruitItem{}
+		sum.fruitItemByClient[clientID] = fruitItemMap
+	}
+
 	for _, fruitRecord := range fruitRecords {
-		_, ok := sum.fruitItemMap[fruitRecord.Fruit]
+		_, ok := fruitItemMap[fruitRecord.Fruit]
 		if ok {
-			sum.fruitItemMap[fruitRecord.Fruit] = sum.fruitItemMap[fruitRecord.Fruit].Sum(fruitRecord)
+			fruitItemMap[fruitRecord.Fruit] = fruitItemMap[fruitRecord.Fruit].Sum(fruitRecord)
 		} else {
-			sum.fruitItemMap[fruitRecord.Fruit] = fruitRecord
+			fruitItemMap[fruitRecord.Fruit] = fruitRecord
 		}
 	}
 	return nil

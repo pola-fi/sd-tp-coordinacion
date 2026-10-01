@@ -3,6 +3,7 @@ package sum
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -21,9 +22,12 @@ type SumConfig struct {
 }
 
 type Sum struct {
-	inputQueue        middleware.Middleware
-	outputExchange    middleware.Middleware
-	fruitItemByClient map[uint32]map[string]fruititem.FruitItem
+	inputQueue            middleware.Middleware
+	outputExchange        middleware.Middleware
+	controlInputExchange  middleware.Middleware
+	controlOutputExchange middleware.Middleware
+	fruitItemByClient     map[uint32]map[string]fruititem.FruitItem
+	fruitItemMutex        sync.Mutex
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -45,17 +49,61 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
+	controlOutputExchangeRouteKeys := make([]string, config.SumAmount)
+	for i := range config.SumAmount {
+		controlOutputExchangeRouteKeys[i] = fmt.Sprintf("%s_%d", config.SumPrefix, i)
+	}
+
+	controlOutputExchange, err := middleware.CreateExchangeMiddleware(config.SumPrefix, controlOutputExchangeRouteKeys, connSettings)
+	if err != nil {
+		outputExchange.Close()
+		inputQueue.Close()
+		return nil, err
+	}
+
+	controlInputExchangeRouteKey := []string{fmt.Sprintf("%s_%d", config.SumPrefix, config.Id)}
+	controlInputExchange, err := middleware.CreateExchangeMiddleware(config.SumPrefix, controlInputExchangeRouteKey, connSettings)
+	if err != nil {
+		controlOutputExchange.Close()
+		outputExchange.Close()
+		inputQueue.Close()
+		return nil, err
+	}
+
 	return &Sum{
-		inputQueue:        inputQueue,
-		outputExchange:    outputExchange,
-		fruitItemByClient: map[uint32]map[string]fruititem.FruitItem{},
+		inputQueue:            inputQueue,
+		outputExchange:        outputExchange,
+		controlInputExchange:  controlInputExchange,
+		controlOutputExchange: controlOutputExchange,
+		fruitItemByClient:     map[uint32]map[string]fruititem.FruitItem{},
 	}, nil
 }
 
 func (sum *Sum) Run() {
+	go sum.controlInputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+		sum.handleControlMessage(msg, ack, nack)
+	})
+
 	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
+}
+
+func (sum *Sum) handleControlMessage(msg middleware.Message, ack func(), nack func()) {
+	defer ack()
+
+	message, err := inner.Deserialize(&msg)
+	if err != nil {
+		slog.Error("While deserializing control message", "err", err)
+		return
+	}
+	if message.Type != inner.EOFMessage {
+		slog.Error("Unexpected inner control message type", "type", message.Type)
+		return
+	}
+	if err := sum.flushClient(message.ClientID); err != nil {
+		slog.Error("While handling end of record control message", "err", err)
+	}
 }
 
 func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -83,6 +131,22 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 
 func (sum *Sum) handleEndOfRecordMessage(clientID uint32) error {
 	slog.Info("Received End Of Records message")
+	wire, err := inner.Serialize(inner.Message{Type: inner.EOFMessage, ClientID: clientID})
+	if err != nil {
+		slog.Debug("While serializing EOF control message", "err", err)
+		return err
+	}
+	if err := sum.controlOutputExchange.Send(*wire); err != nil {
+		slog.Debug("While sending EOF control message", "err", err)
+		return err
+	}
+	return nil
+}
+
+func (sum *Sum) flushClient(clientID uint32) error {
+	sum.fruitItemMutex.Lock()
+	defer sum.fruitItemMutex.Unlock()
+
 	fruitItemMap := sum.fruitItemByClient[clientID]
 	defer delete(sum.fruitItemByClient, clientID)
 
@@ -112,6 +176,9 @@ func (sum *Sum) handleEndOfRecordMessage(clientID uint32) error {
 }
 
 func (sum *Sum) handleDataMessage(clientID uint32, fruitRecords []fruititem.FruitItem) error {
+	sum.fruitItemMutex.Lock()
+	defer sum.fruitItemMutex.Unlock()
+
 	fruitItemMap := sum.fruitItemByClient[clientID]
 	if fruitItemMap == nil {
 		fruitItemMap = map[string]fruititem.FruitItem{}

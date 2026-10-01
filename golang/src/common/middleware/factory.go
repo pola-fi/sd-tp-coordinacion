@@ -15,6 +15,7 @@ import (
 const (
 	brokerUser       = "guest"
 	brokerPassword   = "guest"
+	queuePrefetch    = 1
 	exchangePrefetch = 1
 )
 
@@ -58,7 +59,7 @@ func (q *queueMiddleware) StartConsuming(callback func(msg Message, ack func(), 
 	if err := q.broker.declareQueue(q.name); err != nil {
 		return err
 	}
-	return q.broker.consume(q.name, 0, callback)
+	return q.broker.consume(q.name, queuePrefetch, callback)
 }
 
 func (q *queueMiddleware) StopConsuming() error {

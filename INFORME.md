@@ -44,6 +44,7 @@
 
 - Sum, Aggregation y Join manejan SIGINT y SIGTERM.
 - La señal detiene el consumo principal. `Run` espera el callback en curso y ejecuta el cierre aunque el consumo haya terminado por error.
+- Si falla el consumidor de control de un Sum, se detiene también el consumo principal y `Run` devuelve el error.
 - Se cierran primero las entradas y después las salidas para no cortar un envío pendiente.
 - En el Sum se cierra `inputQueue`, luego el consumidor de control y finalmente los exchanges de salida.
 
@@ -52,4 +53,4 @@
 - La coordinación de EOF tiene la carrera descrita anteriormente. El conteo total de mensajes queda como mejora posible.
 - Cada Sum abre un middleware por Aggregation. Con N Sum y M Aggregation hay N x M conexiones de datos.
 - El hash reparte bien muchas claves, pero con pocas frutas distintas puede dejar carga despareja.
-- Gateway envía un mensaje por registro y no se puede agrupar sin cambiar su implementación. El agrupado entre Sum y Aggregation también queda pendiente.
+- Gateway envía un mensaje por registro y no se puede agrupar sin cambiar su implementación. El agrupado entre Sum y Aggregation se mantiene pendiente.

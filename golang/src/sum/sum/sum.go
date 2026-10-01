@@ -95,18 +95,31 @@ func NewSum(config SumConfig) (*Sum, error) {
 func (sum *Sum) Run() error {
 	defer sum.close()
 
+	controlErr := make(chan error, 1)
 	go func() {
 		if err := sum.controlInputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 			sum.handleControlMessage(msg, ack, nack)
 		}); err != nil {
-			slog.Error("While consuming control messages", "err", err)
+			controlErr <- err
+			if stopErr := sum.inputQueue.StopConsuming(); stopErr != nil {
+				slog.Error("While stopping input consumption", "err", stopErr)
+			}
 		}
 	}()
 	go sum.handleSignals()
 
-	return sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	if err := sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
-	})
+	}); err != nil {
+		return err
+	}
+
+	select {
+	case err := <-controlErr:
+		return err
+	default:
+		return nil
+	}
 }
 
 func (sum *Sum) handleSignals() {

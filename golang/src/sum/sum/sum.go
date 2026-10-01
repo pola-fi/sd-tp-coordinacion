@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -89,14 +92,50 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}, nil
 }
 
-func (sum *Sum) Run() {
-	go sum.controlInputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleControlMessage(msg, ack, nack)
-	})
+func (sum *Sum) Run() error {
+	defer sum.close()
 
-	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+	go func() {
+		if err := sum.controlInputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+			sum.handleControlMessage(msg, ack, nack)
+		}); err != nil {
+			slog.Error("While consuming control messages", "err", err)
+		}
+	}()
+	go sum.handleSignals()
+
+	return sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		sum.handleMessage(msg, ack, nack)
 	})
+}
+
+func (sum *Sum) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	<-signals
+	slog.Info("SIGTERM signal received")
+	if err := sum.inputQueue.StopConsuming(); err != nil {
+		slog.Error("While stopping input consumption", "err", err)
+	}
+}
+
+func (sum *Sum) close() {
+	if err := sum.inputQueue.Close(); err != nil {
+		slog.Error("While closing input queue", "err", err)
+	}
+	if err := sum.controlInputExchange.Close(); err != nil {
+		slog.Error("While closing control input exchange", "err", err)
+	}
+	for _, outputExchange := range sum.outputExchanges {
+		if err := outputExchange.Close(); err != nil {
+			slog.Error("While closing output exchange", "err", err)
+		}
+	}
+	if err := sum.controlOutputExchange.Close(); err != nil {
+		slog.Error("While closing control output exchange", "err", err)
+	}
 }
 
 func (sum *Sum) handleControlMessage(msg middleware.Message, ack func(), nack func()) {

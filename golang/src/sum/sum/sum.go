@@ -2,6 +2,7 @@ package sum
 
 import (
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 
@@ -23,11 +24,12 @@ type SumConfig struct {
 
 type Sum struct {
 	inputQueue            middleware.Middleware
-	outputExchange        middleware.Middleware
+	outputExchanges       []middleware.Middleware
 	controlInputExchange  middleware.Middleware
 	controlOutputExchange middleware.Middleware
 	fruitItemByClient     map[uint32]map[string]fruititem.FruitItem
 	fruitItemMutex        sync.Mutex
+	aggregationAmount     int
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -38,15 +40,18 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
-	outputExchangeRouteKeys := make([]string, config.AggregationAmount)
+	outputExchanges := make([]middleware.Middleware, 0, config.AggregationAmount)
 	for i := range config.AggregationAmount {
-		outputExchangeRouteKeys[i] = fmt.Sprintf("%s_%d", config.AggregationPrefix, i)
-	}
-
-	outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKeys, connSettings)
-	if err != nil {
-		inputQueue.Close()
-		return nil, err
+		outputExchangeRouteKey := []string{fmt.Sprintf("%s_%d", config.AggregationPrefix, i)}
+		outputExchange, err := middleware.CreateExchangeMiddleware(config.AggregationPrefix, outputExchangeRouteKey, connSettings)
+		if err != nil {
+			for _, createdOutputExchange := range outputExchanges {
+				createdOutputExchange.Close()
+			}
+			inputQueue.Close()
+			return nil, err
+		}
+		outputExchanges = append(outputExchanges, outputExchange)
 	}
 
 	controlOutputExchangeRouteKeys := make([]string, config.SumAmount)
@@ -56,7 +61,9 @@ func NewSum(config SumConfig) (*Sum, error) {
 
 	controlOutputExchange, err := middleware.CreateExchangeMiddleware(config.SumPrefix, controlOutputExchangeRouteKeys, connSettings)
 	if err != nil {
-		outputExchange.Close()
+		for _, outputExchange := range outputExchanges {
+			outputExchange.Close()
+		}
 		inputQueue.Close()
 		return nil, err
 	}
@@ -65,17 +72,20 @@ func NewSum(config SumConfig) (*Sum, error) {
 	controlInputExchange, err := middleware.CreateExchangeMiddleware(config.SumPrefix, controlInputExchangeRouteKey, connSettings)
 	if err != nil {
 		controlOutputExchange.Close()
-		outputExchange.Close()
+		for _, outputExchange := range outputExchanges {
+			outputExchange.Close()
+		}
 		inputQueue.Close()
 		return nil, err
 	}
 
 	return &Sum{
 		inputQueue:            inputQueue,
-		outputExchange:        outputExchange,
+		outputExchanges:       outputExchanges,
 		controlInputExchange:  controlInputExchange,
 		controlOutputExchange: controlOutputExchange,
 		fruitItemByClient:     map[uint32]map[string]fruititem.FruitItem{},
+		aggregationAmount:     config.AggregationAmount,
 	}, nil
 }
 
@@ -157,7 +167,8 @@ func (sum *Sum) flushClient(clientID uint32) error {
 			slog.Debug("While serializing message", "err", err)
 			return err
 		}
-		if err := sum.outputExchange.Send(*wire); err != nil {
+		outputExchange := sum.outputExchanges[sum.aggregationShard(fruitItemMap[key].Fruit)]
+		if err := outputExchange.Send(*wire); err != nil {
 			slog.Debug("While sending message", "err", err)
 			return err
 		}
@@ -168,11 +179,19 @@ func (sum *Sum) flushClient(clientID uint32) error {
 		slog.Debug("While serializing EOF message", "err", err)
 		return err
 	}
-	if err := sum.outputExchange.Send(*wire); err != nil {
-		slog.Debug("While sending EOF message", "err", err)
-		return err
+	for _, outputExchange := range sum.outputExchanges {
+		if err := outputExchange.Send(*wire); err != nil {
+			slog.Debug("While sending EOF message", "err", err)
+			return err
+		}
 	}
 	return nil
+}
+
+func (sum *Sum) aggregationShard(fruit string) int {
+	hasher := fnv.New32a()
+	_, _ = hasher.Write([]byte(fruit))
+	return int(hasher.Sum32() % uint32(sum.aggregationAmount))
 }
 
 func (sum *Sum) handleDataMessage(clientID uint32, fruitRecords []fruititem.FruitItem) error {
